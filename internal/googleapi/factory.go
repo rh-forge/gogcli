@@ -32,12 +32,14 @@ import (
 )
 
 type FactoryOptions struct {
+	GmailReadProxyURL   string
 	PhotosBaseURL       string
 	PhotosPickerBaseURL string
 }
 
 type Factory struct {
 	auth                AuthDependencies
+	gmailReadProxyURL   string
 	photosBaseURL       string
 	photosPickerBaseURL string
 }
@@ -45,6 +47,7 @@ type Factory struct {
 func NewFactory(auth AuthDependencies, options FactoryOptions) Factory {
 	return Factory{
 		auth:                auth,
+		gmailReadProxyURL:   options.GmailReadProxyURL,
 		photosBaseURL:       options.PhotosBaseURL,
 		photosPickerBaseURL: options.PhotosPickerBaseURL,
 	}
@@ -119,10 +122,18 @@ func (f Factory) Forms(ctx context.Context, account string) (*forms.Service, err
 }
 
 func (f Factory) Gmail(ctx context.Context, account string) (*gmail.Service, error) {
+	if f.gmailReadProxyURL != "" {
+		return newGmailReadProxy(ctx, f.gmailReadProxyURL)
+	}
+
 	return NewGmail(f.withAuth(ctx), account)
 }
 
 func (f Factory) GmailDelete(ctx context.Context, account string) (*gmail.Service, error) {
+	if f.gmailReadProxyURL != "" {
+		return newGmailReadProxy(ctx, f.gmailReadProxyURL)
+	}
+
 	return NewGmailBatchDelete(f.withAuth(ctx), account)
 }
 
