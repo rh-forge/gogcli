@@ -296,6 +296,7 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 	}
 	ctx = googleapi.WithAuthDependencies(ctx, authDependencies)
 	composeRuntimeGoogleServices(runtime, googleapi.NewFactory(authDependencies, googleapi.FactoryOptions{
+		GmailReadProxyURL:   gmailReadProxyURLFromEnv(),
 		PhotosBaseURL:       os.Getenv("GOG_PHOTOS_BASE_URL"),
 		PhotosPickerBaseURL: os.Getenv("GOG_PHOTOS_PICKER_BASE_URL"),
 	}))
@@ -357,6 +358,13 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 		_, _ = fmt.Fprintln(runtimeIO.Err, msg)
 	}
 	return err
+}
+
+func gmailReadProxyURLFromEnv() string {
+	if value := os.Getenv("GOG_GMAIL_READ_PROXY_URL"); value != "" {
+		return value
+	}
+	return os.Getenv("GOG_GMAIL_BASE_URL")
 }
 
 func rewriteHelpArgs(args []string) []string {
