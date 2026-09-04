@@ -1,0 +1,177 @@
+name: publish-image
+
+# Build this fork's artifact image (Containerfile.artifact: a FROM scratch
+# image containing only the static gog binary at /gog) and publish it to the
+# organisation's private GitHub Container Registry as ghcr.io/rh-forge/gog.
+#
+# Consumers pin it by tag *and* digest, e.g. in rh-forge/openclaw-saw-image:
+#   ARG GOG_IMAGE=ghcr.io/rh-forge/gog:sha-<commit>@sha256:<digest>
+# so sha-<commit> tags must be immutable: the guard step below refuses to
+# publish a commit whose sha- tag already exists. A re-run must never
+# re-point sha-<commit> at a new digest -- the old digest would become
+# untagged and prune-images would delete it, breaking every pinned consumer.
+# There is deliberately no semver/tag trigger here for the same reason: this
+# fork cuts no releases, and every published artifact maps 1:1 to a commit.
+#
+# Pull requests build the image and hand it off as an OCI-archive artifact
+# instead of pushing. The publish-pr-image workflow (workflow_run) picks the
+# artifact up and pushes it as pr-<number>. The split exists because
+# GITHUB_TOKEN is downgraded to read-only on pull_request runs from forks --
+# so this workflow's PR path only ever reads, and the privileged half never
+# executes PR code. PR builds publish only pr-<number>, so unreviewed images
+# stay clearly labelled and never enter the sha-* namespace.
+#
+# `latest` tracks the default branch. Nothing should pin it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# GITHUB_TOKEN can push to ghcr.io for repositories in this organisation, so
+# no PAT and no organisation secret is needed.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: gog
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/gog
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Full history and tags: the version stamp comes from git describe.
+          fetch-depth: 0
+
+      - name: Derive version metadata
+        id: build-meta
+        run: |
+          set -euo pipefail
+          {
+            echo "version=$(git describe --tags --always)"
+            echo "commit=$(git rev-parse --short=12 HEAD)"
+            # Commit date rather than wall clock, so rebuilding the same
+            # commit stamps the same date.
+            echo "date=$(git log -1 --format=%cI)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to republish an existing sha- tag
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | skopeo login ghcr.io --username "${{ github.actor }}" --password-stdin
+          ref="docker://${REGISTRY_IMAGE}:sha-${GITHUB_SHA}"
+          if digest=$(skopeo inspect --no-tags --format '{{.Digest}}' "$ref" 2>/dev/null); then
+            echo "::error::${REGISTRY_IMAGE}:sha-${GITHUB_SHA} is already published as ${digest}."
+            echo "::error::sha- tags are immutable (consumers pin them by digest). Push a new commit to publish a new artifact."
+            exit 1
+          fi
+          echo "No existing artifact for sha-${GITHUB_SHA}; proceeding."
+
+      - id: meta
+        name: Derive tags and OCI labels
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE }}
+
+      - name: Build and push
+        id: build
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Containerfile.artifact
+          # Stated, not inherited: a silent runner flip would ship binaries
+          # that die on the cluster with "Exec format error".
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.build-meta.outputs.version }}
+            COMMIT=${{ steps.build-meta.outputs.commit }}
+            DATE=${{ steps.build-meta.outputs.date }}
+          cache-from: type=gha,scope=${{ env.IMAGE }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE }},ignore-error=true
+          # Suppress the unknown/unknown attestation manifest. With a single
+          # platform this also makes the pushed object a plain manifest, so
+          # the digest below is exactly what FROM ...@sha256 needs.
+          provenance: false
+
+      - name: Record the pin for consumers
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Published ${REGISTRY_IMAGE}"
+            echo
+            echo "Pin (tag and digest):"
+            echo
+            echo '```'
+            echo "${REGISTRY_IMAGE}:sha-${GITHUB_SHA}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Bump the consumer with:"
+            echo
+            echo '```'
+            echo "scripts/bump-tool-pin.sh ${IMAGE} sha-${GITHUB_SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Deliberately untagged: each tag becomes a separate entry in the
+      # archive's index and skopeo then refuses to pick ("more than one
+      # image in oci"). The destination tag is applied by publish-pr-image.
+      - name: Build to OCI archive
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Containerfile.artifact
+          platforms: linux/amd64
+          outputs: type=oci,dest=/tmp/${{ env.IMAGE }}.tar
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.build-meta.outputs.version }}
+            COMMIT=${{ steps.build-meta.outputs.commit }}
+            DATE=${{ steps.build-meta.outputs.date }}
+          cache-from: type=gha,scope=${{ env.IMAGE }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE }},ignore-error=true
+          provenance: false
+
+      - name: Upload image artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr-image-${{ env.IMAGE }}
+          path: /tmp/${{ env.IMAGE }}.tar
+          retention-days: 1
+          compression-level: 0

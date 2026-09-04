@@ -1,0 +1,132 @@
+name: publish-pr-image
+
+# Second half of the PR image pipeline. The publish-image workflow builds PR
+# images without credentials and uploads them as OCI archives; this workflow
+# runs in the base-repository context (workflow_run), so it holds a real
+# GITHUB_TOKEN even when the PR came from a fork, and pushes the archives to
+# ghcr.io as pr-<number>.
+#
+# Deliberately NOT gated on the triggering run's conclusion: a PR image is a
+# debugging artifact, and it is most useful exactly when tests fail. The PR
+# still fails verification through its own checks; this workflow only ever
+# writes the pr-<number> tag, never sha-*/latest/semver, so a failing PR
+# cannot contaminate any tag a deployment consumes. If the image build
+# itself failed there is simply no artifact, and this run skips cleanly.
+#
+# Everything taken from the triggering run is untrusted -- the artifact was
+# built from unreviewed PR code. This workflow therefore
+#   - never executes anything from the artifact: skopeo streams it to the
+#     registry as data,
+#   - only pushes image names on the hard-coded allowlist below, so a
+#     malicious PR cannot rename its artifact to overwrite another
+#     repository's package, and
+#   - derives the PR number from the head SHA via the API instead of
+#     trusting anything the PR run wrote.
+#
+# workflow_run always executes this file as it exists on the default branch,
+# never the PR's copy.
+
+on:
+  workflow_run:
+    workflows: [publish-image]
+    types: [completed]
+
+permissions:
+  contents: read
+  # Download artifacts from the triggering run.
+  actions: read
+  # List the PRs associated with the head commit.
+  pull-requests: read
+  packages: write
+
+concurrency:
+  group: publish-pr-image-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+env:
+  # Images this workflow is willing to push. Keep in step with the image
+  # matrix in the publish-image workflow.
+  ALLOWED_IMAGES: gog
+
+jobs:
+  push:
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find the open PR for this head SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # The SHA-equality filter also drops runs whose PR has since gained
+          # newer commits -- the newer run, not this one, owns the pr-N tag.
+          number=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/pulls" \
+            --jq "[.[] | select(.state == \"open\" and .head.sha == \"${HEAD_SHA}\")][0].number // empty")
+          if [ -z "$number" ]; then
+            echo "No open PR has ${HEAD_SHA} as its head; nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download image artifacts
+        if: steps.pr.outputs.skip != 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: pr-image-*
+          path: /tmp/pr-images
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to ghcr.io
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          shopt -s nullglob
+          dirs=(/tmp/pr-images/pr-image-*/)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            # The triggering run failed before any image built, or its path
+            # filters skipped the image jobs. Nothing to publish.
+            echo "No image artifacts on run ${{ github.event.workflow_run.id }}; skipping."
+            exit 0
+          fi
+          echo "$GH_TOKEN" | skopeo login ghcr.io --username "${{ github.actor }}" --password-stdin
+          for dir in "${dirs[@]}"; do
+            image=$(basename "$dir")
+            image=${image#pr-image-}
+            case " $ALLOWED_IMAGES " in
+              *" $image "*) ;;
+              *)
+                echo "::warning::ignoring artifact for unexpected image '$image'"
+                continue
+                ;;
+            esac
+            dest="ghcr.io/${{ github.repository_owner }}/${image}:pr-${PR_NUMBER}"
+
+            # Remember what pr-N pointed at so the superseded digest can be
+            # deleted after the tag moves; empty on the PR's first push.
+            old_digest=$(skopeo inspect --format '{{.Digest}}' --no-tags "docker://${dest}" 2>/dev/null || true)
+
+            skopeo copy "oci-archive:${dir}${image}.tar" "docker://${dest}"
+
+            new_digest=$(skopeo inspect --format '{{.Digest}}' --no-tags "docker://${dest}")
+            if [ -n "$old_digest" ] && [ "$old_digest" != "$new_digest" ]; then
+              # Delete exactly the version the tag moved off of, and only if
+              # nothing else still tags it. Never a blanket untagged purge:
+              # that would also hit child manifests of any future multi-arch
+              # index, which are listed as untagged versions.
+              id=$(gh api "orgs/${{ github.repository_owner }}/packages/container/${image}/versions" \
+                --paginate \
+                --jq ".[] | select(.name == \"${old_digest}\" and (.metadata.container.tags | length == 0)) | .id")
+              if [ -n "$id" ]; then
+                echo "Deleting superseded ${image}@${old_digest} (version ${id})"
+                gh api --method DELETE \
+                  "orgs/${{ github.repository_owner }}/packages/container/${image}/versions/${id}"
+              fi
+            fi
+          done

@@ -1,0 +1,87 @@
+name: prune-images
+
+# Weekly registry hygiene: delete package versions that are MAX_AGE_DAYS old
+# or older and are either
+#   - tagged only pr-* : images whose close-time cleanup was missed, or for
+#     open PRs untouched for a month -- the next push to such a PR simply
+#     republishes its image, or
+#   - untagged        : orphaned digests that escaped the inline superseded-
+#     digest deletion in publish-pr-image (e.g. a run that failed mid-push).
+#
+# sha-*, semver and latest tags are never deleted regardless of age, and any
+# digest referenced as a child of a *tagged* index is skipped, so this stays
+# safe if builds ever go multi-arch (GHCR lists index children as untagged
+# versions).
+#
+# Note: GitHub suspends cron workflows after ~60 days without repository
+# activity; a push re-arms them.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only report what would be deleted
+        type: boolean
+        default: true
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      # Keep in step with the image matrix in the publish-image workflow.
+      IMAGES: gog
+      MAX_AGE_DAYS: 30
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Empty on scheduled runs, which therefore delete for real.
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Prune old PR images and orphans
+        run: |
+          set -euo pipefail
+          owner="${{ github.repository_owner }}"
+          cutoff=$(date -u -d "${MAX_AGE_DAYS} days ago" +%s)
+          echo "$GH_TOKEN" | skopeo login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+          for image in $IMAGES; do
+            versions=$(gh api "orgs/${owner}/packages/container/${image}/versions" --paginate)
+
+            # Digests referenced by any tagged index must survive, or the
+            # tagged image breaks.
+            protected=$(echo "$versions" \
+              | jq -r '.[] | select(.metadata.container.tags | length > 0) | .name' \
+              | while read -r digest; do
+                  skopeo inspect --raw "docker://ghcr.io/${owner}/${image}@${digest}" \
+                    | jq -r '.manifests[]?.digest // empty'
+                done | sort -u)
+
+            candidates=$(echo "$versions" | jq -r --argjson cutoff "$cutoff" '
+              .[]
+              | select((.updated_at | fromdateiso8601) <= $cutoff)
+              | select((.metadata.container.tags | length == 0)
+                       or (.metadata.container.tags | all(startswith("pr-"))))
+              | "\(.id)\t\(.name)\t\(.metadata.container.tags | join(","))"')
+
+            if [ -z "$candidates" ]; then
+              echo "${image}: nothing ${MAX_AGE_DAYS}+ days old to prune."
+              continue
+            fi
+
+            while IFS=$'\t' read -r id name tags; do
+              [ -z "$id" ] && continue
+              if [ -n "$protected" ] && echo "$protected" | grep -qx "$name"; then
+                echo "${image}: keeping ${name} (child of a tagged index)"
+                continue
+              fi
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "${image}: DRY RUN, would delete version ${id} (${tags:-untagged}) ${name}"
+              else
+                echo "${image}: deleting version ${id} (${tags:-untagged}) ${name}"
+                gh api --method DELETE \
+                  "orgs/${owner}/packages/container/${image}/versions/${id}"
+              fi
+            done <<< "$candidates"
+          done

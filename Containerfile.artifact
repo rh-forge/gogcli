@@ -1,0 +1,49 @@
+# Artifact image for the gog CLI: a FROM scratch image whose only content is
+# the static binary at /gog. Consumers (rh-forge/openclaw-saw-image) inline it
+# with a digest-pinned `FROM ghcr.io/rh-forge/gog:sha-<commit>@sha256:... AS
+# gog-artifact` / `COPY --from=gog-artifact /gog /usr/local/bin/gog`, so the
+# heavyweight Go build happens here, once per fork commit, not in every
+# downstream image build. Published by .github/workflows/publish-image.yml.
+#
+# Same build recipe as upstream's Dockerfile (CGO_ENABLED=0, -trimpath,
+# stripped, version/commit/date stamped via -X). gog embeds tzdata; CA
+# certificates come from the consumer image. Version metadata arrives as
+# build-args because .dockerignore excludes .git.
+#
+# hi/go only publishes stream-level tags (1.26), not exact patch pins, so the
+# digest was resolved from that tag at the time of pinning. Re-resolve with
+# `skopeo inspect --no-tags --override-os linux --override-arch amd64 \
+#    --format '{{.Digest}}' docker://registry.access.redhat.com/hi/go:1.26`
+# when a newer patch is wanted.
+ARG GO_IMAGE=registry.access.redhat.com/hi/go:1.26@sha256:78aea4b29a79c66de2b6b6fbe9dae2f3d00d5c371b7d6cb50c2b08bc8ca001a1
+
+FROM ${GO_IMAGE} AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+
+# TARGETARCH is the platform the image is being built for (BuildKit and
+# buildah both set it), so `--platform linux/amd64` yields an amd64 binary
+# even on an arm64 builder, and a native arm64 trial build works locally. The
+# published arch is decided by the workflow's `platforms:` setting, which
+# states linux/amd64 explicitly.
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath \
+      -ldflags="-s -w -X github.com/openclaw/gogcli/internal/cmd.version=${VERSION} -X github.com/openclaw/gogcli/internal/cmd.commit=${COMMIT} -X github.com/openclaw/gogcli/internal/cmd.date=${DATE}" \
+      -o /out/gog ./cmd/gog \
+    && /out/gog --version
+
+FROM scratch
+
+LABEL org.opencontainers.image.source="https://github.com/rh-forge/gogcli"
+LABEL org.opencontainers.image.description="gog CLI static binary (artifact image; not runnable on its own)"
+LABEL org.opencontainers.image.licenses="MIT"
+
+COPY --from=build /out/gog /gog
