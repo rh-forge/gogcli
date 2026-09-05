@@ -67,6 +67,7 @@ func newGoogleReadProxyClient(endpoint, bearer string) (*http.Client, string, er
 	if err != nil {
 		return nil, "", err
 	}
+
 	if strings.TrimSpace(bearer) == "" {
 		return nil, "", errGoogleReadProxyBearer
 	}
