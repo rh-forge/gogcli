@@ -3,53 +3,39 @@ package googleapi
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 )
 
 var (
-	errGoogleReadProxyEndpoint    = errors.New("google read proxy blocks request outside its configured endpoint")
-	errGoogleReadProxyCredentials = errors.New("google read proxy blocks credentials in the request URL")
 	errGoogleReadProxyAbsoluteURL = errors.New("GOG_GMAIL_READ_PROXY_URL must be an absolute URL")
 	errGoogleReadProxyScheme      = errors.New("GOG_GMAIL_READ_PROXY_URL must use HTTP or HTTPS")
-	errGoogleReadProxyLoopback    = errors.New("GOG_GMAIL_READ_PROXY_URL must use a loopback IP address")
 	errGoogleReadProxyOrigin      = errors.New("GOG_GMAIL_READ_PROXY_URL must be an origin without credentials, path, query, or fragment")
+	errGoogleReadProxyBearer      = errors.New("GOG_GMAIL_READ_PROXY_URL requires GOG_ACCESS_TOKEN (the caller credential toward the read proxy)")
 )
 
-var googleReadProxyCredentialHeaders = []string{
-	"Authorization",
-	"Cookie",
-	"Proxy-Authorization",
-	"X-Goog-Api-Key",
-}
-
+// googleReadProxyTransport presents the caller's credential toward the read
+// proxy on every request. That credential (GOG_ACCESS_TOKEN) is not a Google
+// token: in a governed sandbox it is an OpenShell provider placeholder the
+// supervisor substitutes in transit, otherwise the proxy's static bearer.
+// The proxy authenticates the caller with it and holds the real Google
+// credential itself.
+//
+// Nothing else is enforced here. Which destinations, methods and paths a
+// request may reach is the read proxy's and the sandbox network policy's
+// decision, applied to every process; this client holds no Google
+// credential that could leak, and the HTTP client already drops
+// Authorization on cross-host redirects.
 type googleReadProxyTransport struct {
-	base         http.RoundTripper
-	origin       string
-	allowRequest func(*http.Request) error
+	base   http.RoundTripper
+	bearer string
 }
 
 func (t googleReadProxyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	if request.URL.Scheme+"://"+request.URL.Host != t.origin {
-		return nil, errGoogleReadProxyEndpoint
-	}
-
-	if request.URL.Query().Has("access_token") || request.URL.Query().Has("key") {
-		return nil, errGoogleReadProxyCredentials
-	}
-
-	if err := t.allowRequest(request); err != nil {
-		return nil, err
-	}
-
 	forwarded := request.Clone(request.Context())
 	forwarded.Header = request.Header.Clone()
-
-	for _, name := range googleReadProxyCredentialHeaders {
-		forwarded.Header.Del(name)
-	}
+	forwarded.Header.Set("Authorization", "Bearer "+t.bearer)
 
 	response, err := t.base.RoundTrip(forwarded)
 	if err != nil {
@@ -69,11 +55,6 @@ func normalizeGoogleReadProxyURL(value string) (string, error) {
 		return "", errGoogleReadProxyScheme
 	}
 
-	ip := net.ParseIP(parsed.Hostname())
-	if ip == nil || !ip.IsLoopback() {
-		return "", errGoogleReadProxyLoopback
-	}
-
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
 		return "", errGoogleReadProxyOrigin
 	}
@@ -81,25 +62,19 @@ func normalizeGoogleReadProxyURL(value string) (string, error) {
 	return parsed.Scheme + "://" + parsed.Host + "/", nil
 }
 
-func newGoogleReadProxyClient(endpoint string, allowRequest func(*http.Request) error) (*http.Client, string, error) {
+func newGoogleReadProxyClient(endpoint, bearer string) (*http.Client, string, error) {
 	normalized, err := normalizeGoogleReadProxyURL(endpoint)
 	if err != nil {
 		return nil, "", err
 	}
-
-	parsed, err := url.Parse(normalized)
-	if err != nil {
-		return nil, "", fmt.Errorf("parse normalized Google read proxy URL: %w", err)
+	if strings.TrimSpace(bearer) == "" {
+		return nil, "", errGoogleReadProxyBearer
 	}
 
 	client := &http.Client{
 		Transport: googleReadProxyTransport{
-			base:         newBaseTransport(),
-			origin:       parsed.Scheme + "://" + parsed.Host,
-			allowRequest: allowRequest,
-		},
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
+			base:   newBaseTransport(),
+			bearer: strings.TrimSpace(bearer),
 		},
 	}
 

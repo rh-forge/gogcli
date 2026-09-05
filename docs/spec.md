@@ -176,7 +176,7 @@ Environment:
 - `GOG_ENABLE_COMMANDS_EXACT=calendar.events,gmail.search` (optional exact allowlist; dot paths allowed; parent paths do not allow children)
 - `GOG_DISABLE_COMMANDS=gmail.send,gmail.drafts.send` (optional denylist; dot paths allowed)
 - `GOG_GMAIL_NO_SEND=1` (block Gmail send operations)
-- `GOG_GMAIL_READ_PROXY_URL=http://127.0.0.1:8080/` (route Gmail reads through an unauthenticated loopback proxy; only loopback IP origins are accepted, write methods and redirects are blocked, and OAuth credentials are never attached)
+- `GOG_GMAIL_READ_PROXY_URL=https://host.containers.internal:18081/` (route Gmail reads through the governed read proxy without Google authentication; any HTTP(S) origin is accepted, and `GOG_ACCESS_TOKEN` is required and sent as the caller's bearer toward the proxy — a governed placeholder or the proxy's static credential, never a Google token. Which destinations, methods and paths are allowed is the proxy's and the sandbox policy's decision, not the client's)
 - `GOG_GMAIL_BASE_URL` remains a deprecated alias for `GOG_GMAIL_READ_PROXY_URL`; when both are set, `GOG_GMAIL_READ_PROXY_URL` wins
 - `config.json` can also set `keyring_backend` (JSON5; env vars take precedence)
 - `config.json` can also set `default_timezone` (IANA name or `UTC`)

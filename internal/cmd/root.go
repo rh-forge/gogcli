@@ -296,9 +296,13 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
 	}
 	ctx = googleapi.WithAuthDependencies(ctx, authDependencies)
 	composeRuntimeGoogleServices(runtime, googleapi.NewFactory(authDependencies, googleapi.FactoryOptions{
-		GmailReadProxyURL:   gmailReadProxyURLFromEnv(),
-		PhotosBaseURL:       os.Getenv("GOG_PHOTOS_BASE_URL"),
-		PhotosPickerBaseURL: os.Getenv("GOG_PHOTOS_PICKER_BASE_URL"),
+		GmailReadProxyURL: gmailReadProxyURLFromEnv(),
+		// In read-proxy mode GOG_ACCESS_TOKEN is the caller credential toward
+		// the proxy (a governed placeholder or the proxy's static bearer),
+		// never a Google token.
+		GmailReadProxyBearer: directAccessToken(&cli.RootFlags),
+		PhotosBaseURL:        os.Getenv("GOG_PHOTOS_BASE_URL"),
+		PhotosPickerBaseURL:  os.Getenv("GOG_PHOTOS_PICKER_BASE_URL"),
 	}))
 	ctx = authclient.WithCredentialsReader(ctx, readCredentials)
 	ctx = authclient.WithSecretsStoreOpener(ctx, openTokens)
