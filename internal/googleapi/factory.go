@@ -32,24 +32,30 @@ import (
 )
 
 type FactoryOptions struct {
-	GmailReadProxyURL   string
-	PhotosBaseURL       string
-	PhotosPickerBaseURL string
+	GmailReadProxyURL string
+	// GmailReadProxyBearer is the caller credential presented to the Gmail
+	// read proxy (GOG_ACCESS_TOKEN). Required whenever GmailReadProxyURL is
+	// set; never a Google token.
+	GmailReadProxyBearer string
+	PhotosBaseURL        string
+	PhotosPickerBaseURL  string
 }
 
 type Factory struct {
-	auth                AuthDependencies
-	gmailReadProxyURL   string
-	photosBaseURL       string
-	photosPickerBaseURL string
+	auth                 AuthDependencies
+	gmailReadProxyURL    string
+	gmailReadProxyBearer string
+	photosBaseURL        string
+	photosPickerBaseURL  string
 }
 
 func NewFactory(auth AuthDependencies, options FactoryOptions) Factory {
 	return Factory{
-		auth:                auth,
-		gmailReadProxyURL:   options.GmailReadProxyURL,
-		photosBaseURL:       options.PhotosBaseURL,
-		photosPickerBaseURL: options.PhotosPickerBaseURL,
+		auth:                 auth,
+		gmailReadProxyURL:    options.GmailReadProxyURL,
+		gmailReadProxyBearer: options.GmailReadProxyBearer,
+		photosBaseURL:        options.PhotosBaseURL,
+		photosPickerBaseURL:  options.PhotosPickerBaseURL,
 	}
 }
 
@@ -123,7 +129,7 @@ func (f Factory) Forms(ctx context.Context, account string) (*forms.Service, err
 
 func (f Factory) Gmail(ctx context.Context, account string) (*gmail.Service, error) {
 	if f.gmailReadProxyURL != "" {
-		return newGmailReadProxy(ctx, f.gmailReadProxyURL)
+		return newGmailReadProxy(ctx, f.gmailReadProxyURL, f.gmailReadProxyBearer)
 	}
 
 	return NewGmail(f.withAuth(ctx), account)
@@ -131,7 +137,7 @@ func (f Factory) Gmail(ctx context.Context, account string) (*gmail.Service, err
 
 func (f Factory) GmailDelete(ctx context.Context, account string) (*gmail.Service, error) {
 	if f.gmailReadProxyURL != "" {
-		return newGmailReadProxy(ctx, f.gmailReadProxyURL)
+		return newGmailReadProxy(ctx, f.gmailReadProxyURL, f.gmailReadProxyBearer)
 	}
 
 	return NewGmailBatchDelete(f.withAuth(ctx), account)

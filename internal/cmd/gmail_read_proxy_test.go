@@ -8,7 +8,7 @@ import (
 	"github.com/openclaw/gogcli/internal/app"
 )
 
-func TestGmailReadProxyCommandUsesNoAuthentication(t *testing.T) {
+func TestGmailReadProxyCommandPresentsOnlyTheCallerBearer(t *testing.T) {
 	for _, envName := range []string{"GOG_GMAIL_READ_PROXY_URL", "GOG_GMAIL_BASE_URL"} {
 		t.Run(envName, func(t *testing.T) {
 			requestSeen := make(chan *http.Request, 1)
@@ -21,6 +21,7 @@ func TestGmailReadProxyCommandUsesNoAuthentication(t *testing.T) {
 			t.Setenv("GOG_GMAIL_READ_PROXY_URL", "")
 			t.Setenv("GOG_GMAIL_BASE_URL", "")
 			t.Setenv(envName, server.URL)
+			t.Setenv("GOG_ACCESS_TOKEN", "openshell:resolve:gmail-read-proxy:0123")
 
 			result := executeWithTestRuntime(t, []string{
 				"--json", "--account", "proxy@localhost", "gmail", "get", "message-1",
@@ -30,8 +31,11 @@ func TestGmailReadProxyCommandUsesNoAuthentication(t *testing.T) {
 			}
 
 			request := <-requestSeen
-			if got := request.Header.Get("Authorization"); got != "" {
-				t.Fatalf("Authorization = %q, want empty", got)
+			// No Google OAuth happened (the account has no stored token); the
+			// request carries exactly the caller credential from the
+			// environment, which the governed proxy authenticates.
+			if got := request.Header.Get("Authorization"); got != "Bearer openshell:resolve:gmail-read-proxy:0123" {
+				t.Fatalf("Authorization = %q, want the caller bearer", got)
 			}
 		})
 	}
