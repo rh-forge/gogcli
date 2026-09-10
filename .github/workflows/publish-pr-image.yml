@@ -20,8 +20,9 @@ name: publish-pr-image
 #   - only pushes image names on the hard-coded allowlist below, so a
 #     malicious PR cannot rename its artifact to overwrite another
 #     repository's package, and
-#   - derives the PR number from the head SHA via the API instead of
-#     trusting anything the PR run wrote.
+#   - resolves the PR number from the workflow_run payload's head
+#     repository, branch and SHA via the API instead of trusting anything
+#     the PR run wrote.
 #
 # workflow_run always executes this file as it exists on the default branch,
 # never the PR's copy.
@@ -60,13 +61,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
+          # Look the PR up by head repository and branch, not by commit:
+          # `GET /repos/{repo}/commits/{sha}/pulls` returns nothing for the
+          # head commit of an open PR from a fork (measured 2026-09-09 on
+          # rh-forge-ui #97 and #98), and fork PRs are routine in this
+          # organisation. All three inputs are written by GitHub into the
+          # workflow_run payload; nothing here is taken from the PR run's
+          # artifacts.
+          #
           # The SHA-equality filter also drops runs whose PR has since gained
           # newer commits -- the newer run, not this one, owns the pr-N tag.
-          number=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/pulls" \
-            --jq "[.[] | select(.state == \"open\" and .head.sha == \"${HEAD_SHA}\")][0].number // empty")
+          number=$(gh api --method GET "repos/${{ github.repository }}/pulls" \
+            -f head="${HEAD_OWNER}:${HEAD_BRANCH}" -f state=open \
+            --jq "[.[] | select(.head.sha == \"${HEAD_SHA}\")][0].number // empty")
           if [ -z "$number" ]; then
-            echo "No open PR has ${HEAD_SHA} as its head; nothing to publish."
+            echo "No open PR from ${HEAD_OWNER}:${HEAD_BRANCH} has ${HEAD_SHA} as its head; nothing to publish."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "number=$number" >> "$GITHUB_OUTPUT"
